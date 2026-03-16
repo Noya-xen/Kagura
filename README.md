@@ -1,6 +1,6 @@
 # Kagura (AirdropsQuest) Auto Mission & Daily Claim — Multi-Account
 
-Script Python untuk **auto claim daily login** dan **auto complete task/mission** di `airdropsquest.com`, dengan dukungan **multi-account** via `cookies.txt`.
+Script Python untuk **auto claim daily login** dan **auto complete task/mission** di `https://airdropsquest.com?ref=GASFELNX&lang=en`, dengan dukungan **multi-account** via `cookies.txt`.
 
 ## Fitur
 
