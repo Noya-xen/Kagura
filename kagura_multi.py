@@ -5,6 +5,12 @@ Reads cookies from cookies.txt (one per line)
 Automatically claims daily login and completes all available tasks.
 Skips/hides finished missions.
 Features: Accept Friends, Free Gacha Spin
+
+Fix Log:
+- accept_all_friends  : removed invalid meta wrapper from POST payload
+- get_daily_free_spin_status : split dari batch 4 jadi standalone call
+- spin_gacha          : hapus costPoints:0 yang menyebabkan server reject
+- semua fungsi        : tambah HTTP status code check
 """
 
 import requests
@@ -62,6 +68,7 @@ def log_err(msg):  log(f"❌ {msg}", R)
 def log_info(msg): log(f"ℹ️  {msg}", C)
 def log_warn(msg): log(f"⚠️  {msg}", Y)
 def log_task(msg): log(f"🎯 {msg}", M)
+def log_dbg(msg):  log(f"🔍 [DBG] {msg}", Y)  # debug — aktifkan manual jika perlu
 
 
 def printCredit():
@@ -72,63 +79,92 @@ def printCredit():
 
 
 # ============================================================
+# Helpers
+# ============================================================
+def _safe_post(url, headers, payload, timeout=15):
+    """POST wrapper dengan HTTP status check."""
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        if resp.status_code not in (200, 201):
+            return None, f"HTTP {resp.status_code}"
+        return resp.json(), ""
+    except Exception as e:
+        return None, str(e)
+
+
+def _safe_get(url, headers, timeout=15):
+    """GET wrapper dengan HTTP status check."""
+    try:
+        resp = requests.get(url, headers=headers, timeout=timeout)
+        if resp.status_code != 200:
+            return None, f"HTTP {resp.status_code}"
+        return resp.json(), ""
+    except Exception as e:
+        return None, str(e)
+
+
+# ============================================================
 # API Functions
 # ============================================================
 def check_auth(headers):
     url = f"{BASE_URL}/auth.me?batch=1&input=%7B%220%22%3A%7B%22json%22%3Anull%7D%7D"
+    data, err = _safe_get(url, headers)
+    if not data:
+        return None
     try:
-        resp = requests.get(url, headers=headers, timeout=15)
-        data = resp.json()
         result = data[0]
         if "result" in result:
             user = result["result"]["data"]["json"]
             if user:
                 return user
-        return None
     except Exception:
-        return None
+        pass
+    return None
+
 
 def get_participant(headers):
-    # Correct payload: {"0":{"json":null,"meta":{"values":["undefined"]}}}
     input_data = json.dumps({"0": {"json": None, "meta": {"values": ["undefined"]}}})
     encoded = urllib.parse.quote(input_data)
     url = f"{BASE_URL}/quest.getMyParticipant?batch=1&input={encoded}"
+    data, err = _safe_get(url, headers)
+    if not data:
+        log_warn(f"getMyParticipant: {err}")
+        return None
     try:
-        resp = requests.get(url, headers=headers, timeout=15)
-        data = resp.json()
         result = data[0]
         if "result" in result:
             return result["result"]["data"]["json"]
         elif "error" in result:
             log_warn(f"getMyParticipant error: {result['error']['json'].get('message','?')}")
     except Exception as e:
-        log_warn(f"getMyParticipant exception: {e}")
+        log_warn(f"getMyParticipant parse error: {e}")
     return None
 
+
 def claim_daily(headers, participant_id):
-    """Claim daily login reward using quest.claimDailyLoginBonus"""
     url = f"{BASE_URL}/quest.claimDailyLoginBonus?batch=1"
     payload = {"0": {"json": {"participantId": participant_id}}}
+    data, err = _safe_post(url, headers, payload)
+    if not data:
+        return False, 0, err
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=15)
-        data = resp.json()
         result = data[0]
         if "result" in result:
             res_data = result["result"]["data"]["json"]
-            if isinstance(res_data, dict) and "scoreValue" in res_data:
-                return True, res_data.get("scoreValue", 10), ""
-            return True, 10, ""
+            pts = res_data.get("scoreValue", 10) if isinstance(res_data, dict) else 10
+            return True, pts, ""
         elif "error" in result:
-            msg = result["error"]["json"]["message"]
-            return False, 0, msg
+            return False, 0, result["error"]["json"]["message"]
     except Exception as e:
         return False, 0, str(e)
 
+
 def get_tasks(headers):
     url = f"{BASE_URL}/quest.getTasks?batch=1&input=%7B%220%22%3A%7B%22json%22%3Anull%7D%7D"
+    data, err = _safe_get(url, headers)
+    if not data:
+        return []
     try:
-        resp = requests.get(url, headers=headers, timeout=15)
-        data = resp.json()
         result = data[0]
         if "result" in result:
             return result["result"]["data"]["json"]
@@ -136,12 +172,14 @@ def get_tasks(headers):
         pass
     return []
 
+
 def complete_task(headers, participant_id, task_id):
     url = f"{BASE_URL}/quest.completeTask?batch=1"
     payload = {"0": {"json": {"participantId": participant_id, "taskId": task_id}}}
+    data, err = _safe_post(url, headers, payload)
+    if not data:
+        return False, 0, err
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=15)
-        data = resp.json()
         result = data[0]
         if "result" in result:
             res_data = result["result"]["data"]["json"]
@@ -153,20 +191,56 @@ def complete_task(headers, participant_id, task_id):
     except Exception as e:
         return False, 0, str(e)
 
+
 # ============================================================
-# NEW: Accept All Friends
+# FIX #1: Accept All Friends
 # ============================================================
 def accept_all_friends(headers):
-    """Accept all pending friend requests via quest.acceptAllFriendRequests"""
+    """
+    Accept all pending friend requests.
+
+    BUG LAMA: POST payload pakai meta: {"values": ["undefined"]} — format ini
+    hanya relevan untuk GET tRPC (supaya server decode query param sebagai undefined).
+    Pada POST body, meta wrapper ini justru menyebabkan server menolak atau
+    mengembalikan unexpected response.
+
+    FIX: Kirim {"0": {"json": null}} saja (standar tRPC POST tanpa argumen).
+    Kalau null juga gagal, fallback ke {"0": {"json": {}}} (empty object).
+    """
     url = f"{BASE_URL}/quest.acceptAllFriendRequests?batch=1"
-    payload = {"0": {"json": None, "meta": {"values": ["undefined"]}}}
+
+    # Coba dengan null dulu (tRPC standard no-arg POST)
+    payload = {"0": {"json": None}}
+    data, err = _safe_post(url, headers, payload)
+
+    # Fallback: coba empty object jika null ditolak
+    if not data or (isinstance(data, list) and data and "error" in data[0]):
+        err_preview = ""
+        if data and isinstance(data, list) and "error" in data[0]:
+            err_preview = data[0]["error"]["json"].get("message", "")
+        if "invalid" in err_preview.lower() or "expected" in err_preview.lower():
+            payload = {"0": {"json": {}}}
+            data, err = _safe_post(url, headers, payload)
+
+    if not data:
+        return False, 0, err
+
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=15)
-        data = resp.json()
         result = data[0]
         if "result" in result:
             res_data = result["result"]["data"]["json"]
-            count = res_data.get("count", 0) if isinstance(res_data, dict) else 0
+            if isinstance(res_data, dict):
+                # Platform bisa return berbagai field name
+                count = (
+                    res_data.get("count") or
+                    res_data.get("accepted") or
+                    res_data.get("friendsAccepted") or
+                    0
+                )
+            elif isinstance(res_data, int):
+                count = res_data
+            else:
+                count = 0
             return True, count, ""
         elif "error" in result:
             msg = result["error"]["json"].get("message", "Unknown error")
@@ -174,82 +248,129 @@ def accept_all_friends(headers):
     except Exception as e:
         return False, 0, str(e)
 
-def get_pending_friend_count(headers, participant_id):
-    """Get number of pending friend requests"""
-    input_data = json.dumps({
-        "0": {"json": None, "meta": {"values": ["undefined"]}},
-        "1": {"json": {"pendingReferralCode": None, "meta": {"values": {"pendingReferralCode": ["undefined"]}}}},
-        "2": {"json": {"pendingReferralCode": None, "meta": {"values": {"pendingReferralCode": ["undefined"]}}}}
-    })
-    encoded = urllib.parse.quote(input_data)
-    url = (
-        f"{BASE_URL}/quest.getFriendsWithStats,quest.getMyParticipant,"
-        f"quest.getFriendsWithStats?batch=1&input={encoded}"
-    )
-    try:
-        resp = requests.get(url, headers=headers, timeout=15)
-        data = resp.json()
-        if data and len(data) > 0 and "result" in data[0]:
-            res = data[0]["result"]["data"]["json"]
-            pending = res.get("pendingCount", 0) if isinstance(res, dict) else 0
-            return pending
-    except Exception:
-        pass
-    return 0
 
 # ============================================================
-# NEW: Daily Free Gacha Spin
+# FIX #2: Daily Free Gacha Spin
 # ============================================================
 def get_daily_free_spin_status(headers, participant_id):
-    """Check if daily free spin is available via getDailyFreeSpinStatus"""
-    input_data = json.dumps({
-        "0": {"json": None, "meta": {"values": ["undefined"]}},
-        "1": {"json": {"participantId": participant_id, "limit": 10}},
-        "2": {"json": {"participantId": participant_id}},
-        "3": {"json": {"participantId": participant_id}}
-    })
+    """
+    Check if daily free spin is available.
+
+    BUG LAMA: Fungsi ini melakukan batch 4 endpoint sekaligus:
+    getMyParticipant + getGachaHistory + getGachaSpinStatus + getDailyFreeSpinStatus
+    Masalahnya:
+    1. Jika SATU saja dari 4 endpoint error, seluruh batch bisa gagal atau
+       menggeser index response → data[3] jadi salah.
+    2. Input untuk index 0 masih pakai meta wrapper → bisa conflict.
+    3. Tidak perlu data dari 3 endpoint lain hanya untuk cek spin status.
+
+    FIX: Panggil getDailyFreeSpinStatus secara standalone (batch=1, 1 endpoint).
+    Jika endpoint tidak tersedia, fallback ke getGachaSpinStatus.
+    """
+    # ── Coba getDailyFreeSpinStatus dulu ────────────────────
+    input_data = json.dumps({"0": {"json": {"participantId": participant_id}}})
     encoded = urllib.parse.quote(input_data)
-    url = (
-        f"{BASE_URL}/quest.getMyParticipant,quest.getGachaHistory,"
-        f"quest.getGachaSpinStatus,quest.getDailyFreeSpinStatus"
-        f"?batch=1&input={encoded}"
-    )
-    try:
-        resp = requests.get(url, headers=headers, timeout=15)
-        data = resp.json()
-        # Index 3 → getDailyFreeSpinStatus
-        if len(data) >= 4 and "result" in data[3]:
-            status = data[3]["result"]["data"]["json"]
-            is_available = status.get("isAvailable", False) if isinstance(status, dict) else False
+    url = f"{BASE_URL}/quest.getDailyFreeSpinStatus?batch=1&input={encoded}"
+
+    data, err = _safe_get(url, headers)
+
+    if data and isinstance(data, list) and len(data) > 0:
+        result = data[0]
+        if "result" in result:
+            status = result["result"]["data"]["json"]
+            is_available = (
+                status.get("isAvailable", False)
+                if isinstance(status, dict) else bool(status)
+            )
             return is_available, status
+        elif "error" in result:
+            err_msg = result["error"]["json"].get("message", "")
+            # Endpoint tidak ada → fallback ke getGachaSpinStatus
+            if "no procedure" in err_msg.lower() or "not found" in err_msg.lower():
+                return _get_spin_status_fallback(headers, participant_id)
+            log_warn(f"getDailyFreeSpinStatus: {err_msg[:80]}")
+
+    # Jika HTTP error atau parse error → fallback
+    if err:
+        return _get_spin_status_fallback(headers, participant_id)
+
+    return False, {}
+
+
+def _get_spin_status_fallback(headers, participant_id):
+    """Fallback: getGachaSpinStatus jika getDailyFreeSpinStatus tidak tersedia."""
+    input_data = json.dumps({"0": {"json": {"participantId": participant_id}}})
+    encoded = urllib.parse.quote(input_data)
+    url = f"{BASE_URL}/quest.getGachaSpinStatus?batch=1&input={encoded}"
+
+    data, err = _safe_get(url, headers)
+    if not data:
+        log_warn(f"getGachaSpinStatus fallback: {err}")
         return False, {}
+    try:
+        result = data[0]
+        if "result" in result:
+            status = result["result"]["data"]["json"]
+            # getGachaSpinStatus biasanya return: {freeSpinsAvailable: N, ...}
+            if isinstance(status, dict):
+                free_count = (
+                    status.get("freeSpinsAvailable") or
+                    status.get("freeSpin") or
+                    status.get("dailyFreeSpin") or
+                    0
+                )
+                is_available = int(free_count) > 0
+                return is_available, status
+        elif "error" in result:
+            log_warn(f"getGachaSpinStatus: {result['error']['json'].get('message','?')[:60]}")
     except Exception as e:
-        log_warn(f"getDailyFreeSpinStatus error: {e}")
-        return False, {}
+        log_warn(f"getGachaSpinStatus parse: {e}")
+    return False, {}
+
 
 def spin_gacha(headers, participant_id):
-    """Perform one free gacha spin via quest.spinGacha"""
+    """
+    Perform one free gacha spin.
+
+    BUG LAMA: Payload menyertakan costPoints: 0.
+    Platform bisa menginterpretasi field ini sebagai "bayar 0 poin" yang
+    berbeda dengan "free spin" → server menolak request karena
+    konflik antara costPoints dan isFreeSpin flag.
+
+    FIX: Hapus costPoints dari payload. Kirim hanya participantId + isFreeSpin.
+    """
     url = f"{BASE_URL}/quest.spinGacha?batch=1"
     payload = {
         "0": {
             "json": {
                 "participantId": participant_id,
-                "costPoints": 0,
                 "isFreeSpin": True
+                # costPoints dihapus — konflik dengan isFreeSpin flag
             }
         }
     }
+    data, err = _safe_post(url, headers, payload)
+    if not data:
+        return False, 0, "", err
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=15)
-        data = resp.json()
         result = data[0]
         if "result" in result:
             res_data = result["result"]["data"]["json"]
             reward = 0
             rarity = "?"
             if isinstance(res_data, dict):
-                reward = res_data.get("rewardValue", res_data.get("scoreValue", 0))
-                rarity = res_data.get("rarity", res_data.get("type", "?"))
+                reward = (
+                    res_data.get("rewardValue") or
+                    res_data.get("scoreValue") or
+                    res_data.get("points") or
+                    0
+                )
+                rarity = (
+                    res_data.get("rarity") or
+                    res_data.get("type") or
+                    res_data.get("grade") or
+                    "?"
+                )
             return True, reward, rarity, ""
         elif "error" in result:
             msg = result["error"]["json"].get("message", "Unknown error")
@@ -293,27 +414,30 @@ def process_account(cookie_idx, cookie_val):
         log_ok(f"Daily Claimed! +{pts}pts")
         score_before += pts
     else:
-        if "already" in err_msg.lower() or "already claimed" in err_msg.lower():
+        if "already" in err_msg.lower():
             log_warn("Daily already claimed.")
         elif "no procedure found" in err_msg.lower():
             log_warn("API Error: Daily claim endpoint no longer exists.")
         else:
-            log_err(f"Daily Claim failed: {err_msg[:60]}")
+            log_err(f"Daily Claim failed: {err_msg[:80]}")
     time.sleep(1)
 
     # ── Accept All Friends ───────────────────────────────────
     log_info("Checking pending friend requests...")
     ok, count, err = accept_all_friends(headers)
     if ok:
-        if count and count > 0:
-            log_ok(f"Accepted {count} friend request(s)! (+{count * 10} Bond Points)")
+        if count and int(count) > 0:
+            log_ok(f"Accepted {count} friend request(s)!")
         else:
             log_warn("No pending friend requests.")
     else:
-        if "no pending" in err.lower() or "not found" in err.lower():
+        low = err.lower()
+        if any(k in low for k in ("no pending", "not found", "empty", "no friend")):
             log_warn("No pending friend requests.")
+        elif "http 4" in low:
+            log_err(f"Accept Friends auth/API error: {err}")
         else:
-            log_err(f"Accept Friends failed: {err[:60]}")
+            log_err(f"Accept Friends failed: {err[:80]}")
     time.sleep(1)
 
     # ── Daily Free Gacha Spin ────────────────────────────────
@@ -324,12 +448,15 @@ def process_account(cookie_idx, cookie_val):
         spin_ok, reward, rarity, spin_err = spin_gacha(headers, pid)
         if spin_ok:
             log_ok(f"🎰 Gacha Result: [{rarity.upper()}] → +{reward}pts")
-            score_before += reward
+            score_before += int(reward)
         else:
-            if "already" in spin_err.lower() or "no free" in spin_err.lower():
-                log_warn(f"Free spin already used today.")
+            low = spin_err.lower()
+            if "already" in low or "no free" in low or "used" in low:
+                log_warn("Free spin already used today.")
+            elif "http 4" in low:
+                log_err(f"Gacha spin auth/API error: {spin_err}")
             else:
-                log_err(f"Gacha Spin failed: {spin_err[:60]}")
+                log_err(f"Gacha Spin failed: {spin_err[:80]}")
     else:
         log_warn("No free spin available today.")
     time.sleep(1)
@@ -357,8 +484,8 @@ def process_account(cookie_idx, cookie_val):
             new_points += pts
             log_ok(f"Task Completed: {name} ({ttype}) → +{pts}pts")
         else:
-            if "完了" not in err_msg and "already" not in err_msg.lower():
-                log_err(f"Task Failed: {name} ({ttype}) → {err_msg[:60]}")
+            if err_msg and "already" not in err_msg.lower() and "完了" not in err_msg:
+                log_err(f"Task Failed: {name} ({ttype}) → {err_msg[:80]}")
 
         time.sleep(1)
 
